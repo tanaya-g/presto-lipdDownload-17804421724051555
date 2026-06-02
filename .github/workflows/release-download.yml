@@ -1,0 +1,224 @@
+name: Release Download
+
+# Bundles every successful LiPD download into a tagged GitHub Release so
+# the data + the inputs that produced it survive long after the Actions
+# artifact retention (90 days) expires. Each release captures the LiPD
+# data file (zip of .lpd files for filtered runs, or the compilation .pkl
+# for archived runs), the query that produced it, the cleaning report
+# (if any), and the auto-regenerated README.md.
+#
+# Triggers on a successful "LiPD File Download" run, or manual dispatch
+# with an explicit run id. Idempotent: a download-<run_id> release is
+# created at most once. If a previous run created the release but failed
+# before attaching the data asset, this workflow re-attempts the upload
+# rather than skip.
+#
+# ── GitHub-Zenodo integration (optional) ──────────────────────────────
+# Releases produced by this workflow can be auto-archived to Zenodo with
+# citable DOIs. To enable on a custom downloads repo:
+#   1. Sign in at https://zenodo.org/account/settings/github/ with the
+#      repo owner's GitHub account.
+#   2. Toggle the switch next to this repository to "On".
+#   3. Cut a release. Zenodo mints a version DOI per release and a
+#      stable concept DOI for the repo as a whole.
+
+on:
+  workflow_run:
+    workflows: ["LiPD File Download"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      download_run_id:
+        description: 'lipd-download run ID to release (default: latest successful)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    name: Bundle LiPD download into a GitHub Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve lipd-download run ID
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.download_run_id }}" ]; then
+            DL_RUN_ID="${{ inputs.download_run_id }}"
+          else
+            # The lipd-download-data-<id> artifact is uploaded by
+            # lipd-download.yml. Take the most recent unexpired one as
+            # the source of truth.
+            DL_RUN_ID=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name | startswith("lipd-download-data-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id')
+          fi
+          if [ -z "$DL_RUN_ID" ] || [ "$DL_RUN_ID" = "null" ]; then
+            echo "ERROR: could not resolve a lipd-download run ID"
+            exit 1
+          fi
+          DL_RUN_NUMBER=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${DL_RUN_ID}" \
+            --jq '.run_number')
+          TAG="download-${DL_RUN_ID}"
+          echo "dl_run_id=${DL_RUN_ID}" >> $GITHUB_OUTPUT
+          echo "dl_run_number=${DL_RUN_NUMBER}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Check release state
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Resumability: if a previous run created the release but failed
+          # before attaching the LiPD data asset, we want to re-attempt
+          # the upload. Only skip when the release already has at least
+          # one .zip or .pkl asset attached.
+          TAG="${{ steps.resolve.outputs.tag }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            DATA_COUNT=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+              --jq '[.assets[] | select(.name | test("\\.(zip|pkl)$"))] | length')
+            if [ "$DATA_COUNT" -gt 0 ]; then
+              echo "Release $TAG already has $DATA_COUNT data asset(s) — skipping."
+              echo "skip=true"   >> $GITHUB_OUTPUT
+              echo "exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "Release $TAG exists but has no data asset — will attach missing assets."
+              echo "skip=false"  >> $GITHUB_OUTPUT
+              echo "exists=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "skip=false"   >> $GITHUB_OUTPUT
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download LiPD download artifact
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./bundle/data
+          gh run download "${{ steps.resolve.outputs.dl_run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name "lipd-download-data-${{ steps.resolve.outputs.dl_run_id }}" \
+            --dir ./bundle/data
+          echo "Artifact contents:"
+          ls -lh ./bundle/data/
+
+      - name: Stage repo-side inputs and README snapshot
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          mkdir -p ./bundle/inputs
+          # cleaning_report.json and README_NOTES.md are optional — they
+          # only exist when PReSto's cleaning app or an author has
+          # provided them.
+          for f in cleaning_report.json README.md README_NOTES.md; do
+            [ -f "$f" ] && cp "$f" ./bundle/inputs/
+          done
+          ls -lh ./bundle/inputs/ 2>/dev/null || echo "(no repo-side inputs to bundle)"
+
+      - name: Build release notes
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME="${{ github.event.repository.name }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ steps.resolve.outputs.dl_run_id }}"
+
+          # Discover what the artifact actually produced so the notes
+          # match the assets, regardless of which pathway ran.
+          DATA_LIST=""
+          if [ -d ./bundle/data ]; then
+            shopt -s nullglob
+            for f in ./bundle/data/*.zip ./bundle/data/*.pkl; do
+              name=$(basename "$f")
+              case "$name" in
+                lipd_files.zip)
+                  DATA_LIST="${DATA_LIST}- \`${name}\` — zip of raw \`.lpd\` files (filtered pathway via lipdGenerator)"$'\n'
+                  ;;
+                *.pkl)
+                  DATA_LIST="${DATA_LIST}- \`${name}\` — pre-built compilation pickle (archived pathway, downloaded from LiPDverse)"$'\n'
+                  ;;
+                *.zip)
+                  DATA_LIST="${DATA_LIST}- \`${name}\` — LiPD data archive"$'\n'
+                  ;;
+              esac
+            done
+          fi
+          if [ -z "$DATA_LIST" ]; then
+            DATA_LIST="- *no LiPD data file was found in the source artifact*"$'\n'
+          fi
+
+          CLEAN_LINE=""
+          if [ -f ./bundle/inputs/cleaning_report.json ]; then
+            CLEAN_LINE="- \`cleaning_report.json\` — per-record decisions from PReSto's data-cleaning app"$'\n'
+          fi
+          NOTES_LINE=""
+          if [ -f ./bundle/inputs/README_NOTES.md ]; then
+            NOTES_LINE="- \`README_NOTES.md\` — author-provided notes (rendered into README.md)"$'\n'
+          fi
+
+          {
+            echo "LiPD download snapshot from run [#${{ steps.resolve.outputs.dl_run_number }}](${RUN_URL})."
+            echo ""
+            echo "**Bundled assets**"
+            echo ""
+            printf '%s' "$DATA_LIST"
+            echo "- \`query_params.json\` — query that produced this download"
+            printf '%s' "$CLEAN_LINE"
+            echo "- \`README.md\` — auto-regenerated repo README (snapshot)"
+            printf '%s' "$NOTES_LINE"
+            echo ""
+            echo "Release auto-created by [release-download.yml](.github/workflows/release-download.yml). The LiPD data is captured here because the upstream Actions artifact has a 90-day retention; this release preserves it indefinitely. If the [GitHub-Zenodo integration](https://docs.github.com/en/repositories/archiving-a-github-repository/referencing-and-citing-content) is enabled on this repo, each release receives a citable DOI."
+          } > release_notes.md
+
+      - name: Create or update release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Flatten asset paths so the release attaches files at top level.
+          ASSETS=()
+          if [ -d ./bundle/data ]; then
+            while IFS= read -r f; do
+              ASSETS+=("$f")
+            done < <(find ./bundle/data -type f \( -name '*.zip' -o -name '*.pkl' -o -name 'query_params.json' \))
+          fi
+          for path in \
+              ./bundle/inputs/cleaning_report.json \
+              ./bundle/inputs/README.md \
+              ./bundle/inputs/README_NOTES.md \
+          ; do
+            if [ -f "$path" ]; then
+              ASSETS+=("$path")
+            fi
+          done
+          echo "Attaching ${#ASSETS[@]} files:"
+          printf '  %s\n' "${ASSETS[@]}"
+
+          if [ "${{ steps.existing.outputs.exists }}" = "true" ]; then
+            # Resuming a release that exists but lacked the data asset:
+            # upload the missing files and refresh the notes.
+            gh release upload "${{ steps.resolve.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --clobber \
+              "${ASSETS[@]}"
+            gh release edit "${{ steps.resolve.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --notes-file release_notes.md
+          else
+            gh release create "${{ steps.resolve.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --title "LiPD download #${{ steps.resolve.outputs.dl_run_number }} (run ${{ steps.resolve.outputs.dl_run_id }})" \
+              --notes-file release_notes.md \
+              "${ASSETS[@]}"
+          fi

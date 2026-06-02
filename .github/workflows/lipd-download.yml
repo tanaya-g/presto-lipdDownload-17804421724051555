@@ -1,0 +1,207 @@
+name: LiPD File Download
+
+on:
+  push:
+    paths:
+      - 'query_params.json'   # not in template; server commits this so workflow triggers
+  workflow_dispatch:
+    inputs:
+      lipd_query_json:
+        description: 'LiPD data query parameters (paste full JSON to replay a download)'
+        required: false
+        type: string
+
+jobs:
+  prepare-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      # Bumped from read → write so citation files can be committed to repo root.
+      contents: write
+    outputs:
+      skipped: ${{ steps.pathway.outputs.skip }}
+      mode: ${{ steps.pathway.outputs.mode }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Detect which pathway to use.
+      # Priority order:
+      #   1. query_params.json in repo  — server-committed (push trigger pathway)
+      #   2. lipd_query_json input      — manual workflow_dispatch
+      #
+      # If neither is present, this is almost certainly the initial scaffold
+      # commit during template-repo creation: the PReSto server may commit
+      # other files first and follow with a second commit that adds
+      # query_params.json. We skip the rest of the job with success — the
+      # follow-up push will fire a working run a few seconds later.
+      - name: Detect data acquisition pathway
+        id: pathway
+        run: |
+          if [ -f "query_params.json" ]; then
+            MODE=$(jq -r '.mode' query_params.json)
+            echo "mode=$MODE" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Using query_params.json from repo (mode: $MODE)"
+          elif [ -n "${{ inputs.lipd_query_json }}" ]; then
+            echo '${{ inputs.lipd_query_json }}' > query_params.json
+            MODE=$(jq -r '.mode' query_params.json)
+            echo "mode=$MODE" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Using lipd_query_json input (mode: $MODE)"
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "No query_params.json or lipd_query_json present."
+            echo "Likely the initial scaffold commit during template setup —"
+            echo "the server's follow-up commit will retrigger this workflow."
+            echo "Skipping the rest of this job with success."
+          fi
+
+      # ARCHIVED PATHWAY: download a pre-built compilation pickle directly
+      # from lipdverse.org. No Docker, no filtering — fastest path when the
+      # caller wants a published compilation in its entirety.
+      - name: Download archived compilation
+        if: steps.pathway.outputs.skip != 'true' && steps.pathway.outputs.mode == 'archived'
+        run: |
+          COMPILATION=$(jq -r '.compilation' query_params.json)
+          VERSION=$(jq -r '.version' query_params.json)
+          PICKLE_URL="https://lipdverse.org/${COMPILATION}/${VERSION}/${COMPILATION}${VERSION}.pkl"
+
+          echo "Downloading archived compilation from: $PICKLE_URL"
+          curl -L -f "$PICKLE_URL" -o lipd_data.pkl || {
+            echo "ERROR: Failed to download archived compilation"
+            echo "URL: $PICKLE_URL"
+            exit 1
+          }
+
+          ls -lh lipd_data.pkl
+
+      # FILTERED PATHWAY: Run lipdGenerator to produce .lpd files. Output
+      # is a zip of raw .lpd files so consumers can use any LiPD tooling.
+      - name: Generate LiPD files from query
+        if: steps.pathway.outputs.skip != 'true' && steps.pathway.outputs.mode == 'filtered'
+        run: |
+          echo "Querying lipdverse using query_params.json (see file for full TSID list)..."
+          echo "  mode:         $(jq -r '.mode' query_params.json)"
+          echo "  compilation:  $(jq -r '.compilation' query_params.json)"
+          echo "  version:      $(jq -r '.version' query_params.json)"
+          echo "  tsids:        $(jq '.tsids | length' query_params.json) requested"
+          echo "  removedTsids: $(jq '.removedTsids | length' query_params.json) to remove"
+          mkdir -p lipd_output
+          docker run --rm \
+            -v $(pwd)/query_params.json:/query_params.json:ro \
+            -v $(pwd)/lipd_output:/output \
+            davidedge/lipd_webapps:lipdGenerator /query_params.json /output lpd 2>&1 \
+            | tail -20
+
+          if [ ! -f lipd_output/lipd_files.zip ]; then
+            echo "ERROR: lipdGenerator did not produce lipd_files.zip"
+            ls -la lipd_output/ || true
+            exit 1
+          fi
+
+          echo "lipd_files.zip ready:"
+          ls -lh lipd_output/lipd_files.zip
+
+      - name: Verify output
+        if: steps.pathway.outputs.skip != 'true'
+        run: |
+          if [ -f lipd_output/lipd_files.zip ]; then
+            FILE_SIZE=$(stat -c%s lipd_output/lipd_files.zip 2>/dev/null || stat -f%z lipd_output/lipd_files.zip)
+            echo "lipd_files.zip ready: $FILE_SIZE bytes"
+          elif [ -f lipd_data.pkl ]; then
+            FILE_SIZE=$(stat -c%s lipd_data.pkl 2>/dev/null || stat -f%z lipd_data.pkl)
+            echo "lipd_data.pkl ready: $FILE_SIZE bytes"
+          else
+            echo "ERROR: no LiPD output found (expected lipd_output/lipd_files.zip or lipd_data.pkl)"
+            exit 1
+          fi
+
+      # Bundle the data file together with query_params.json so the release
+      # workflow can recover the inputs that produced this run, even if the
+      # workflow file is later edited.
+      - name: Stage artifact contents
+        if: steps.pathway.outputs.skip != 'true'
+        run: |
+          mkdir -p artifact
+          [ -f lipd_output/lipd_files.zip ] && cp lipd_output/lipd_files.zip artifact/
+          [ -f lipd_data.pkl ]              && cp lipd_data.pkl              artifact/
+          [ -f query_params.json ]          && cp query_params.json          artifact/
+          ls -lh artifact/
+
+      - name: Upload LiPD download artifact
+        if: steps.pathway.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lipd-download-data-${{ github.run_id }}
+          path: artifact/
+          retention-days: 90
+
+      - name: Generate citation files
+        if: steps.pathway.outputs.skip != 'true'
+        run: |
+          RECON_ID=$(jq -r '.uniqueID // empty' query_params.json 2>/dev/null || echo "")
+          [ -z "$RECON_ID" ] && RECON_ID="${{ github.run_id }}"
+          mkdir -p citations_out
+
+          # If the repo already has a curated CITATION.cff (the platform-level
+          # CFF in the lipd-downloads template), merge a data-source addendum
+          # into it instead of overwriting.
+          MERGE_FLAG=""
+          EXTRA_MOUNT=""
+          if [ -f CITATION.cff ]; then
+            EXTRA_MOUNT="-v $(pwd)/CITATION.cff:/existing_cff/CITATION.cff:ro"
+            MERGE_FLAG="--merge-cff=/existing_cff/CITATION.cff"
+            echo "Existing CITATION.cff detected — will merge addendum"
+          fi
+
+          if [ -f lipd_output/lipd_files.zip ]; then
+            docker run --rm \
+              -v "$(pwd)/lipd_output/lipd_files.zip:/data/lipd_files.zip:ro" \
+              -v "$(pwd)/citations_out:/citations_out" \
+              $EXTRA_MOUNT \
+              davidedge/lipd_webapps:lipdGenerator \
+              citations /data/lipd_files.zip /citations_out \
+              --title="LiPD Download $RECON_ID" \
+              --url="https://github.com/${{ github.repository }}" \
+              --unique-id="$RECON_ID" \
+              --author="${{ github.repository_owner }}" \
+              $MERGE_FLAG
+          elif [ -f lipd_data.pkl ]; then
+            docker run --rm \
+              -v "$(pwd)/lipd_data.pkl:/data/lipd_data.pkl:ro" \
+              -v "$(pwd)/citations_out:/citations_out" \
+              $EXTRA_MOUNT \
+              davidedge/lipd_webapps:lipdGenerator \
+              citations /data/lipd_data.pkl /citations_out \
+              --title="LiPD Download $RECON_ID" \
+              --url="https://github.com/${{ github.repository }}" \
+              --unique-id="$RECON_ID" \
+              --author="${{ github.repository_owner }}" \
+              $MERGE_FLAG
+          else
+            echo "No source LiPD data found; skipping citation generation"
+          fi
+
+          ls -lh citations_out/ 2>/dev/null || true
+
+      - name: Commit citation files to repository
+        if: steps.pathway.outputs.skip != 'true'
+        run: |
+          if [ ! -f citations_out/data_references.bib ] && [ ! -f citations_out/CITATION.cff ]; then
+            echo "No citation files generated; nothing to commit"
+            exit 0
+          fi
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          [ -f citations_out/data_references.bib ] && cp citations_out/data_references.bib data_references.bib && git add data_references.bib
+          [ -f citations_out/CITATION.cff ]        && cp citations_out/CITATION.cff        CITATION.cff        && git add CITATION.cff
+          if git diff --staged --quiet; then
+            echo "No citation file changes to commit"
+          else
+            git commit -m "Add data citations for LiPD download ${{ github.run_id }}"
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && git push && break || sleep $((i*5))
+            done
+          fi
